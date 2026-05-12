@@ -1,0 +1,11 @@
+venv
+checkpoints_mini
+results
+checkpoints
+*.cache
+*__pycache__
+*.safetensors
+*tensorboard
+*.pth
+logs
+data
