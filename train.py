@@ -30,7 +30,6 @@ from data.dataset import AnomalyDetectionDataset
 from data.collator import AnomalyDataCollator
 
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -149,6 +148,30 @@ class AnomalyTrainer(Trainer):
 def main():
     args = parse_args()
 
+    # Configure logging to both console and file
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_file = os.path.join(args.output_dir, "train.log")
+
+    # Reset existing handlers to avoid duplicates
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file),
+        ],
+    )
+
+    # Ensure transformers logs are also captured
+    import transformers
+
+    transformers.utils.logging.set_verbosity_info()
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_propagation()
+
     # Clear stale HuggingFace module cache so our modified model code is used
     import shutil
 
@@ -158,7 +181,7 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if local_rank == 0 and os.path.exists(hf_cache_modules):
         shutil.rmtree(hf_cache_modules, ignore_errors=True)
-        rank0_log("Cleared stale HF module cache")
+        rank0_log(f"Cleared stale HF module cache. Logs will be saved to {log_file}")
 
     rank0_log(f"Loading model from {args.model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -323,7 +346,7 @@ def main():
         bf16=True,
         logging_steps=10,
         save_strategy="epoch",
-        save_total_limit=3,
+        save_total_limit=1,
         dataloader_num_workers=4,
         remove_unused_columns=False,  # Important: keep gt_segmentation_masks
         gradient_checkpointing=True,

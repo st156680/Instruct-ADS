@@ -24,9 +24,12 @@ Why 1008?
 """
 
 from typing import List, Dict, Any, Tuple, Union, Optional
+import logging
 
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 class AnomalyDataCollator:
@@ -207,7 +210,7 @@ class AnomalyDataCollator:
             mask_mean = gt_segmentation_masks.float().mean().item()
             mask_sum = gt_segmentation_masks.float().sum().item()
 
-            print(
+            logger.info(
                 "[collator-debug] "
                 f"call={self._num_calls} "
                 f"batch_size={len(features)} "

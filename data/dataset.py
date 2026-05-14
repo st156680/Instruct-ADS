@@ -27,11 +27,14 @@ Expected flow:
 import json
 import os
 from typing import Optional, List, Dict, Any
+import logging
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 class AnomalyDetectionDataset(Dataset):
@@ -290,7 +293,7 @@ class AnomalyDetectionDataset(Dataset):
             estimated_processor_h = int(grid_h * patch_size)
             estimated_processor_w = int(grid_w * patch_size)
 
-            print(
+            logger.info(
                 "[dataset-debug] "
                 f"idx={idx} "
                 f"image_path={image_path} "
