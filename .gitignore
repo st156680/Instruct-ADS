@@ -8,4 +8,5 @@ checkpoints
 *tensorboard
 *.pth
 logs
-data
+data/mvtec
+data/anomaly_dataset

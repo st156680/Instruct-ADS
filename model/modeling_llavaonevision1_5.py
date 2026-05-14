@@ -2422,7 +2422,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
             img_feats = F.normalize(
                 image_embeds_for_seg[layer_idx, :num_patches], dim=-1
             )
-            anomaly_logits = img_feats @ defect_embeds.T
+            anomaly_logits = img_feats @ defect_embeds.T * 10
             layer_map = anomaly_logits.view(1, merged_h, merged_w, 2).permute(
                 0, 3, 1, 2
             )
@@ -2481,23 +2481,8 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
                 )
                 return None
 
-            seg_pos = seg_positions[0].item()
-            seg_normal_pos = seg_normal_positions[0].item()
             seg_embed = last_hidden_state[b, seg_positions[0]]
             seg_normal_embed = last_hidden_state[b, seg_normal_positions[0]]
-
-            # Cosine similarity between the two prototypes (should NOT be ~1.0)
-            cos_sim = F.cosine_similarity(
-                seg_embed.unsqueeze(0), seg_normal_embed.unsqueeze(0)
-            ).item()
-
-            logger.info(
-                f"[seg] batch={b}: defect_pos={seg_pos} normal_pos={seg_normal_pos} "
-                f"| seg_embed norm={seg_embed.norm().item():.4f} "
-                f"| normal_embed norm={seg_normal_embed.norm().item():.4f} "
-                f"| cosine_sim={cos_sim:.4f} "
-                f"| grid=({merged_h}x{merged_w})"
-            )
 
             defect_embeds = torch.stack([seg_normal_embed, seg_embed], dim=0)
             defect_embeds = F.normalize(defect_embeds, dim=-1)
@@ -2526,27 +2511,19 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
                 ]
                 img_feats_norm = F.normalize(img_feats, dim=-1)
 
-                anomaly_logits = img_feats_norm @ defect_embeds.T
-                
-                # Log entropy
-                probs_for_entropy = torch.softmax(anomaly_logits, dim=-1)
-                entropy = -(probs_for_entropy * torch.log(probs_for_entropy + 1e-9)).sum(dim=-1).mean()
-                
+                anomaly_logits = img_feats_norm @ defect_embeds.T * 10
+
                 anomaly_map = anomaly_logits.view(1, merged_h, merged_w, 2).permute(
                     0, 3, 1, 2
                 )
+
+                if layer_idx == 0 and b == 0:
+                    logger.info(
+                        f"[shapes] defect_embeds: {defect_embeds.shape} | "
+                        f"img_feats: {img_feats.shape} | "
+                        f"anomaly_map: {anomaly_map.shape}"
+                    )
                 # Return raw logits, don't apply softmax here
-                
-                # For logging only
-                probs_for_log = torch.softmax(anomaly_map, dim=1)
-                defect_ch = probs_for_log[0, 1]  # [H, W] defect probability
-                logger.info(
-                    f"[seg] layer={layer_idx} batch={b}: "
-                    f"img_feat norm(mean)={img_feats.norm(dim=-1).mean().item():.4f} "
-                    f"| entropy={entropy.item():.4f} "
-                    f"| logits min={anomaly_logits.min().item():.2f} max={anomaly_logits.max().item():.2f} "
-                    f"| defect_map min={defect_ch.min().item():.4f} max={defect_ch.max().item():.4f} mean={defect_ch.mean().item():.4f}"
-                )
 
                 layer_batch_maps.append(anomaly_map)
 
@@ -2594,11 +2571,44 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
                 sample_probs = torch.softmax(sample_logits, dim=1)
                 gt_mask = gt_segmentation_masks[b : b + 1]
 
+                if layer_idx == 0 and b == 0:
+                    gt_lowres = F.interpolate(
+                        gt_mask.unsqueeze(1), size=layer_map.shape[-2:], mode="nearest"
+                    )
+                    gt_roundtrip = F.interpolate(
+                        gt_lowres, size=(mask_h, mask_w), mode="nearest"
+                    )
+
+                    intersection = (gt_roundtrip * gt_mask).sum()
+                    oracle_dice_loss = 1.0 - (2.0 * intersection) / (
+                        gt_roundtrip.sum() + gt_mask.sum() + 1e-6
+                    )
+
+                    logger.info(
+                        f"[oracle_debug] lowres_size = {tuple(layer_map.shape[-2:])}, gt_sum = {gt_mask.sum().item():.2f}, oracle_dice_loss = {oracle_dice_loss.item():.6f}"
+                    )
+
+                    pred = sample_probs[0, 1].detach().float()
+                    gt = gt_mask[0].detach().float()
+
+                    logger.info(
+                        f"[shapes] gt_mask: {gt_segmentation_masks.shape} | "
+                        f"sample_logits: {sample_logits.shape}"
+                    )
+                    logger.info(
+                        f"[pred-debug] pred min = {pred.min():.4f} max = {pred.max():.4f} mean = {pred.mean():.4f} "
+                        f"| gt min = {gt.min():.4f} max = {gt.max():.4f} mean = {gt.mean():.4f}"
+                    )
+
                 gt_sum = gt_mask.sum().item()
                 pred_defect = sample_probs[0, 1]  # defect channel after upsample
 
                 focal = FocalLoss()(sample_logits, gt_mask.unsqueeze(1))
                 dice = BinaryDiceLoss()(sample_probs[:, 1, :, :], gt_mask)
+
+                logger.info(
+                    f"[seg-res] layer_map={layer_map.shape[-2:]} gt_mask={gt_mask.shape[-2:]}"
+                )
 
                 logger.info(
                     f"[loss] layer={layer_idx} batch={b}: "

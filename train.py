@@ -270,29 +270,27 @@ def main():
         # Print trainable parameters after LoRA
         model.print_trainable_parameters()
 
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                rank0_log(f"[grad] {name}: requires_grad=True")
+
         # --- Gradient hook to verify seg_projector is being trained ---
         def _make_grad_hook(name):
             def hook(grad):
                 if grad is not None:
-                    rank0_log(
-                        f"[grad] {name}: norm={grad.norm().item():.6f}"
-                    )
+                    rank0_log(f"[grad] {name}: norm={grad.norm().item():.6f}")
+
             return hook
 
-        seg_proj = getattr(
-            getattr(model, "base_model", model),
-            "model", None
-        )
-        if seg_proj is not None:
-            seg_proj = getattr(seg_proj, "model", seg_proj)  # unwrap PeftModel -> base -> model
-            seg_proj = getattr(seg_proj, "seg_projector", None)
-        if seg_proj is not None:
-            for name, param in seg_proj.named_parameters():
-                if param.requires_grad:
-                    param.register_hook(_make_grad_hook(f"seg_projector.{name}"))
-            rank0_log("Registered gradient hooks on seg_projector")
-        else:
-            rank0_log("WARNING: Could not find seg_projector to register gradient hooks")
+        for name, param in model.named_parameters():
+            if (
+                "seg_projector" in name
+                and "modules_to_save.default" in name
+                and param.requires_grad
+            ):
+                param.register_hook(_make_grad_hook(name))
+                rank0_log(f"Registered gradient hook on {name}")
+
     else:
         rank0_log("Full fine-tuning (No LoRA)")
 
