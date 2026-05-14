@@ -2192,56 +2192,6 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
         cache_position: Optional[torch.LongTensor] = None,
         gt_segmentation_masks: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, LLaVAOneVision1_5_CausalLMOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-        pixel_values_videos (`torch.FloatTensor` of shape `(seq_length, num_channels * temporal_size * image_size * image_size)):
-            The tensors corresponding to the input videos. Pixel values can be obtained using
-            [`AutoImageProcessor`]. See [`Qwen2VLImageProcessor.__call__`] for details. [`Qwen2VLProcessor`] uses
-            [`Qwen2VLImageProcessor`] for processing videos.
-        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
-            The temporal, height and width of feature shape of each image in LLM.
-        video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-            The temporal, height and width of feature shape of each video in LLM.
-        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-            The rope index difference between sequence length and multimodal rope.
-        gt_segmentation_masks (`torch.FloatTensor` of shape `(batch_size, H, W)`, *optional*):
-            Ground truth binary segmentation masks for anomaly detection training.
-            When provided, enables segmentation loss computation alongside LM loss.
-
-        Example:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, AutoModelForCausalLM
-
-        >>> model = AutoModelForCausalLM.from_pretrained("Deep-VLM/LLaVAOV1.5-4b", trust_remote_code=True)
-        >>> processor = AutoProcessor.from_pretrained("Deep-VLM/LLaVAOV1.5-4b", trust_remote_code=True)
-
-        >>> messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "What is shown in this image?"},
-                ],
-            },
-        ]
-        >>> url = "https://www.ilankelman.org/stopsigns/australia.jpg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        >>> inputs = processor(text=[text], images=[image], vision_infos=[vision_infos])
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "The image shows a street scene with a red stop sign in the foreground. In the background, there is a large red gate with Chinese characters ..."
-        ```"""
-
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -2252,11 +2202,10 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
 
-        # When segmentation masks are provided, we need hidden states for SEG token extraction
+        # Force dict output because we need outputs.image_embeds.
+        return_dict = True
+
         if gt_segmentation_masks is not None:
             output_hidden_states = True
 
@@ -2273,25 +2222,31 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
             cache_position=cache_position,
         )
 
-        hidden_states = outputs[0]
+        hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
 
         lm_loss = None
         if labels is not None:
             lm_loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.vocab_size
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
             )
 
-        # --- Segmentation branch ---
         seg_loss = None
         anomaly_maps = None
 
-        if hasattr(self.config, "seg_token_idx") and outputs.image_embeds is not None:
-            # Returns a list of per-layer anomaly maps, each [B, 2, H, W]
+        if (
+            hasattr(self.config, "seg_token_idx")
+            and hasattr(self.config, "seg_normal_token_idx")
+            and outputs.image_embeds is not None
+            and image_grid_thw is not None
+            and input_ids is not None
+        ):
             anomaly_maps = self._compute_anomaly_map(
                 input_ids=input_ids,
                 last_hidden_state=outputs.last_hidden_state,
@@ -2309,24 +2264,35 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
                 gt_segmentation_masks=gt_segmentation_masks,
             )
 
-        # Combine losses
-        loss = lm_loss
-        if seg_loss is not None and lm_loss is not None:
-            loss = lm_loss + seg_loss
-            if torch.distributed.is_initialized():
-                if torch.distributed.get_rank() == 0:
-                    logger.info(
-                        f"lm_loss={lm_loss.item():.4f} seg_loss={seg_loss.item():.4f}"
-                    )
-            else:
+        loss = None
+
+        if lm_loss is not None:
+            loss = lm_loss
+
+        if seg_loss is not None:
+            seg_loss_weight = float(getattr(self.config, "seg_loss_weight", 1.0))
+            weighted_seg_loss = seg_loss_weight * seg_loss
+            loss = weighted_seg_loss if loss is None else loss + weighted_seg_loss
+
+        if lm_loss is not None or seg_loss is not None:
+            should_log = True
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                should_log = torch.distributed.get_rank() == 0
+
+            if should_log:
+                lm_value = "None" if lm_loss is None else f"{lm_loss.item():.6f}"
+                seg_value = "None" if seg_loss is None else f"{seg_loss.item():.6f}"
+                total_value = "None" if loss is None else f"{loss.item():.6f}"
                 logger.info(
-                    f"lm_loss={lm_loss.item():.4f} seg_loss={seg_loss.item():.4f}"
+                    f"[total-loss] lm_loss={lm_value} seg_loss={seg_value} total={total_value}"
                 )
 
-        # Sum anomaly maps across layers for output
         anomaly_map_out = None
         if anomaly_maps is not None:
-            anomaly_map_out = sum(anomaly_maps)
+            # anomaly_maps are raw logits per layer: [B, 2, h, w].
+            # For output/debug, return mean probability map across layers.
+            probs = [torch.softmax(m, dim=1) for m in anomaly_maps]
+            anomaly_map_out = torch.stack(probs, dim=0).mean(dim=0)
 
         return LLaVAOneVision1_5_CausalLMOutputWithPast(
             loss=loss,
@@ -2337,149 +2303,79 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
             rope_deltas=outputs.rope_deltas,
             anomaly_map=anomaly_map_out,
         )
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_ids=None,
-        pixel_values=None,
-        image_grid_thw=None,
-        attention_mask=None,
-        **kwargs,
-    ):
-        # Pre-extract multi-layer image features for anomaly map before generation
-        image_embeds_for_seg = None
-        if pixel_values is not None:
-            _, unmerged_list = self.model.visual(
-                pixel_values.type(self.model.visual.dtype),
-                grid_thw=image_grid_thw,
-                return_unmerged=True,
-            )
-            # Project each layer through seg_projector: [num_layers, N, D]
-            image_embeds_for_seg = torch.stack(
-                [self.model.seg_projector(u) for u in unmerged_list]
-            )
-
-        input_len = input_ids.shape[1]
-
-        # Generate with hidden states exposed at every step
-        output = super().generate(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
-            **kwargs,
-        )
-
-        if image_embeds_for_seg is None or not hasattr(self.config, "seg_token_idx"):
-            return output, None
-
-        generated_sequences = output.sequences  # [B, total_len]
-        hidden_states = output.hidden_states
-
-        seg_token_idx = self.config.seg_token_idx
-        seg_normal_token_idx = self.config.seg_normal_token_idx
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-
-        seg_locs = (generated_sequences[0] == seg_token_idx).nonzero(as_tuple=True)[0]
-        seg_normal_locs = (generated_sequences[0] == seg_normal_token_idx).nonzero(
-            as_tuple=True
-        )[0]
-
-        if len(seg_locs) == 0 or len(seg_normal_locs) == 0:
-            return output, None
-
-        def get_embed_at_position(pos):
-            if pos < input_len:
-                return hidden_states[0][-1][0, pos]
-            else:
-                k = pos.item() - input_len
-                if k + 1 < len(hidden_states):
-                    return hidden_states[k + 1][-1][0, 0]
-                else:
-                    return hidden_states[k][-1][0, -1]
-
-        seg_embed = get_embed_at_position(seg_locs[0])
-        seg_normal_embed = get_embed_at_position(seg_normal_locs[0])
-
-        # Stack: index 0 = normal, index 1 = defect
-        defect_embeds = torch.stack([seg_normal_embed, seg_embed], dim=0)
-        defect_embeds = F.normalize(
-            defect_embeds.to(image_embeds_for_seg.device), dim=-1
-        )
-
-        t, h, w = image_grid_thw[0]
-        merged_h = h.item() // spatial_merge_size
-        merged_w = w.item() // spatial_merge_size
-        num_patches = merged_h * merged_w
-
-        # Compute per-layer anomaly maps and sum them (matches V1.0 generation)
-        num_layers = image_embeds_for_seg.shape[0]
-        anomaly_map = None
-        for layer_idx in range(num_layers):
-            img_feats = F.normalize(
-                image_embeds_for_seg[layer_idx, :num_patches], dim=-1
-            )
-            anomaly_logits = img_feats @ defect_embeds.T * 10
-            layer_map = anomaly_logits.view(1, merged_h, merged_w, 2).permute(
-                0, 3, 1, 2
-            )
-            layer_map = torch.softmax(layer_map, dim=1)
-            anomaly_map = layer_map if anomaly_map is None else anomaly_map + layer_map
-
-        return output, anomaly_map
-
     def _compute_anomaly_map(
-        self,
-        input_ids: torch.LongTensor,
-        last_hidden_state: torch.FloatTensor,
-        image_embeds: torch.FloatTensor,
-        image_grid_thw: torch.LongTensor,
-    ) -> Optional[list]:
-        """
-        Computes per-layer anomaly maps by comparing SEG token embeddings with
-        multi-layer image features.
-
+    self,
+    input_ids: torch.LongTensor,
+    last_hidden_state: torch.FloatTensor,
+    image_embeds: torch.FloatTensor,
+    image_grid_thw: torch.LongTensor,
+) -> Optional[list]:
+        """   
+        Computes per-layer raw anomaly logits by comparing image features with
+        [SEG_NORMAL] and [SEG_DEFECT] token embeddings.
+        
         Args:
-            image_embeds: [num_layers, total_merged_patches, D] or [total_merged_patches, D]
+            input_ids:
+                [B, seq_len]
+
+            last_hidden_state:
+                [B, seq_len, D_text]
+
+            image_embeds:
+                [num_layers, total_merged_patches, D_text]
+                or [total_merged_patches, D_text]
+
+            image_grid_thw:
+                [num_images, 3], expected one image per batch item for current setup.
 
         Returns:
-            List of anomaly map tensors, each [B, 2, merged_h, merged_w], one per layer.
-            Returns None if SEG tokens are not found.
+            List of raw anomaly-logit tensors.
+            Each tensor has shape [B, 2, merged_h, merged_w].
+            Channel 0 = normal.
+            Channel 1 = defect.
         """
         seg_token_idx = self.config.seg_token_idx
         seg_normal_token_idx = self.config.seg_normal_token_idx
         spatial_merge_size = self.config.vision_config.spatial_merge_size
 
-        # Handle single-layer (backward compat) vs multi-layer
+        logit_scale = float(getattr(self.config, "seg_logit_scale", 10.0))
+
         if image_embeds.dim() == 2:
             image_embeds = image_embeds.unsqueeze(0)
-        num_layers = image_embeds.shape[0]
 
+        num_layers = image_embeds.shape[0]
         batch_size = input_ids.shape[0]
 
-        # Extract defect embeddings per batch element (shared across layers)
+        if image_grid_thw.shape[0] < batch_size:
+            logger.info(
+                f"[seg] image_grid_thw has fewer entries than batch_size: "
+                f"image_grid_thw={tuple(image_grid_thw.shape)} batch_size={batch_size}"
+            )
+            return None
+
         batch_defect_embeds = []
         batch_grid_info = []
+
+        patch_offset = 0
+
         for b in range(batch_size):
             seg_positions = (input_ids[b] == seg_token_idx).nonzero(as_tuple=True)[0]
             seg_normal_positions = (input_ids[b] == seg_normal_token_idx).nonzero(
                 as_tuple=True
             )[0]
 
+            if len(seg_positions) == 0 or len(seg_normal_positions) == 0:
+                logger.info(
+                    f"[seg] batch={b}: SEG token missing. "
+                    f"defect_positions={seg_positions.tolist()} "
+                    f"normal_positions={seg_normal_positions.tolist()}"
+                )
+                return None
+
             t, h, w = image_grid_thw[b]
             merged_h = h.item() // spatial_merge_size
             merged_w = w.item() // spatial_merge_size
-
-            if len(seg_positions) == 0 or len(seg_normal_positions) == 0:
-                logger.info(
-                    f"[seg] batch={b}: SEG token NOT FOUND "
-                    f"(defect positions={seg_positions.tolist()}, "
-                    f"normal positions={seg_normal_positions.tolist()})"
-                )
-                return None
+            num_patches = merged_h * merged_w
 
             seg_embed = last_hidden_state[b, seg_positions[0]]
             seg_normal_embed = last_hidden_state[b, seg_normal_positions[0]]
@@ -2487,61 +2383,102 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
             defect_embeds = torch.stack([seg_normal_embed, seg_embed], dim=0)
             defect_embeds = F.normalize(defect_embeds, dim=-1)
 
-            patch_offset = 0
-            for i in range(b):
-                _, hi, wi = image_grid_thw[i]
-                patch_offset += (hi.item() // spatial_merge_size) * (
-                    wi.item() // spatial_merge_size
+            if b == 0:
+                cos_sim = F.cosine_similarity(
+                    seg_embed.unsqueeze(0),
+                    seg_normal_embed.unsqueeze(0),
+                    dim=-1,
+                ).item()
+
+                logger.info(
+                    f"[seg-grid] batch={b} "
+                    f"image_grid_thw=({t.item()}, {h.item()}, {w.item()}) "
+                    f"spatial_merge_size={spatial_merge_size} "
+                    f"merged_grid=({merged_h}, {merged_w}) "
+                    f"num_patches={num_patches} "
+                    f"logit_scale={logit_scale:.4f} "
+                    f"seg_normal_cosine={cos_sim:.6f}"
                 )
 
             batch_defect_embeds.append(defect_embeds)
-            batch_grid_info.append((merged_h, merged_w, patch_offset))
+            batch_grid_info.append((merged_h, merged_w, patch_offset, num_patches))
 
-        # Compute per-layer anomaly maps
+            patch_offset += num_patches
+
+        total_required_patches = patch_offset
+        total_available_patches = image_embeds.shape[1]
+
+        if total_available_patches < total_required_patches:
+            logger.info(
+                f"[seg] Not enough image embeddings: "
+                f"available={total_available_patches}, required={total_required_patches}"
+            )
+            return None
+
         all_layer_maps = []
+
         for layer_idx in range(num_layers):
             layer_batch_maps = []
+
             for b in range(batch_size):
                 defect_embeds = batch_defect_embeds[b]
-                merged_h, merged_w, patch_offset = batch_grid_info[b]
-                num_patches = merged_h * merged_w
+                merged_h, merged_w, patch_offset, num_patches = batch_grid_info[b]
 
                 img_feats = image_embeds[
-                    layer_idx, patch_offset : patch_offset + num_patches
+                    layer_idx,
+                    patch_offset : patch_offset + num_patches,
                 ]
+
                 img_feats_norm = F.normalize(img_feats, dim=-1)
 
-                anomaly_logits = img_feats_norm @ defect_embeds.T * 10
+                anomaly_logits = logit_scale * (img_feats_norm @ defect_embeds.T)
 
                 anomaly_map = anomaly_logits.view(1, merged_h, merged_w, 2).permute(
                     0, 3, 1, 2
                 )
 
                 if layer_idx == 0 and b == 0:
-                    logger.info(
-                        f"[shapes] defect_embeds: {defect_embeds.shape} | "
-                        f"img_feats: {img_feats.shape} | "
-                        f"anomaly_map: {anomaly_map.shape}"
-                    )
-                # Return raw logits, don't apply softmax here
+                    with torch.no_grad():
+                        probs = torch.softmax(anomaly_map, dim=1)
+                        defect_prob = probs[:, 1]
+
+                        logger.info(
+                            f"[seg-map] layer={layer_idx} batch={b} "
+                            f"img_feats={tuple(img_feats.shape)} "
+                            f"defect_embeds={tuple(defect_embeds.shape)} "
+                            f"anomaly_logits_min={anomaly_logits.min().item():.6f} "
+                            f"anomaly_logits_max={anomaly_logits.max().item():.6f} "
+                            f"anomaly_map={tuple(anomaly_map.shape)} "
+                            f"defect_prob_mean={defect_prob.mean().item():.6f} "
+                            f"defect_prob_max={defect_prob.max().item():.6f}"
+                        )
 
                 layer_batch_maps.append(anomaly_map)
 
             all_layer_maps.append(torch.cat(layer_batch_maps, dim=0))
 
         return all_layer_maps
-
+    
     def _compute_seg_loss(
-        self,
-        anomaly_maps: list,
-        gt_segmentation_masks: torch.FloatTensor,
-    ) -> torch.FloatTensor:
+    self,
+    anomaly_maps: list,
+    gt_segmentation_masks: torch.FloatTensor,
+) -> torch.FloatTensor:
         """
-        Compute segmentation loss across all layers.
-        Accumulates focal + dice loss per layer (matches V1.0 behavior).
+        Compute segmentation loss over all anomaly-map layers.
 
-        Args:
-            anomaly_maps: List of tensors, each [B, 2, H, W], one per ViT layer.
+        anomaly_maps:
+            List of raw logits, each [B, 2, h, w].
+
+        gt_segmentation_masks:
+            [B, H, W], binary {0, 1}.
+
+        Loss:
+            focal(logits, gt)
+            + dice(defect_prob, gt)
+            + dice(normal_prob, 1 - gt)
+
+        The final loss is averaged over layers and batch items.
         """
         try:
             from data.loss import FocalLoss, BinaryDiceLoss
@@ -2550,74 +2487,154 @@ class LLaVAOneVision1_5_ForConditionalGeneration(
             import os
 
             sys.path.insert(
-                0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+                0,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
             )
             from data.loss import FocalLoss, BinaryDiceLoss
 
+        if anomaly_maps is None or len(anomaly_maps) == 0:
+            raise ValueError("_compute_seg_loss received no anomaly maps")
+
         device = anomaly_maps[0].device
+        dtype = anomaly_maps[0].dtype
+
+        gt_segmentation_masks = gt_segmentation_masks.to(device=device).float()
+        gt_segmentation_masks = (gt_segmentation_masks > 0.5).float()
+
         batch_size = anomaly_maps[0].shape[0]
         mask_h, mask_w = gt_segmentation_masks.shape[-2:]
-        seg_loss = torch.tensor(0.0, device=device, dtype=anomaly_maps[0].dtype)
+
+        focal_loss_fn = FocalLoss()
+        dice_loss_fn = BinaryDiceLoss()
+
+        seg_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        num_terms = 0
 
         for layer_idx, layer_map in enumerate(anomaly_maps):
+            if layer_map.dim() != 4 or layer_map.shape[1] != 2:
+                raise ValueError(
+                    f"Expected layer_map shape [B, 2, h, w], got {tuple(layer_map.shape)}"
+                )
+
             for b in range(batch_size):
                 sample_logits = F.interpolate(
                     layer_map[b : b + 1],
                     size=(mask_h, mask_w),
                     mode="bilinear",
-                    align_corners=True,
+                    align_corners=False,
                 )
-                # Compute probabilities AFTER interpolation
+
                 sample_probs = torch.softmax(sample_logits, dim=1)
                 gt_mask = gt_segmentation_masks[b : b + 1]
 
+                focal = focal_loss_fn(sample_logits, gt_mask.unsqueeze(1))
+
+                dice_defect = dice_loss_fn(
+                    sample_probs[:, 1, :, :],
+                    gt_mask,
+                )
+
+                dice_normal = dice_loss_fn(
+                    sample_probs[:, 0, :, :],
+                    1.0 - gt_mask,
+                )
+
+                layer_sample_loss = focal + dice_defect + dice_normal
+
+                seg_loss = seg_loss + layer_sample_loss
+                num_terms += 1
+
                 if layer_idx == 0 and b == 0:
-                    gt_lowres = F.interpolate(
-                        gt_mask.unsqueeze(1), size=layer_map.shape[-2:], mode="nearest"
-                    )
-                    gt_roundtrip = F.interpolate(
-                        gt_lowres, size=(mask_h, mask_w), mode="nearest"
-                    )
+                    with torch.no_grad():
+                        pred_defect = sample_probs[0, 1]
+                        pred_normal = sample_probs[0, 0]
 
-                    intersection = (gt_roundtrip * gt_mask).sum()
-                    oracle_dice_loss = 1.0 - (2.0 * intersection) / (
-                        gt_roundtrip.sum() + gt_mask.sum() + 1e-6
-                    )
+                        gt_lowres_nearest = F.interpolate(
+                            gt_mask.unsqueeze(1),
+                            size=layer_map.shape[-2:],
+                            mode="nearest",
+                        )
 
-                    logger.info(
-                        f"[oracle_debug] lowres_size = {tuple(layer_map.shape[-2:])}, gt_sum = {gt_mask.sum().item():.2f}, oracle_dice_loss = {oracle_dice_loss.item():.6f}"
-                    )
+                        gt_roundtrip_nearest = F.interpolate(
+                            gt_lowres_nearest,
+                            size=(mask_h, mask_w),
+                            mode="nearest",
+                        ).squeeze(1)
 
-                    pred = sample_probs[0, 1].detach().float()
-                    gt = gt_mask[0].detach().float()
+                        intersection_nearest = (gt_roundtrip_nearest * gt_mask).sum()
+                        oracle_dice_loss_nearest = 1.0 - (
+                            2.0 * intersection_nearest + 1e-6
+                        ) / (
+                            gt_roundtrip_nearest.sum() + gt_mask.sum() + 1e-6
+                        )
 
-                    logger.info(
-                        f"[shapes] gt_mask: {gt_segmentation_masks.shape} | "
-                        f"sample_logits: {sample_logits.shape}"
-                    )
-                    logger.info(
-                        f"[pred-debug] pred min = {pred.min():.4f} max = {pred.max():.4f} mean = {pred.mean():.4f} "
-                        f"| gt min = {gt.min():.4f} max = {gt.max():.4f} mean = {gt.mean():.4f}"
-                    )
+                        gt_lowres_area = F.interpolate(
+                            gt_mask.unsqueeze(1),
+                            size=layer_map.shape[-2:],
+                            mode="area",
+                        )
 
-                gt_sum = gt_mask.sum().item()
-                pred_defect = sample_probs[0, 1]  # defect channel after upsample
+                        gt_roundtrip_area = F.interpolate(
+                            gt_lowres_area,
+                            size=(mask_h, mask_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(1)
 
-                focal = FocalLoss()(sample_logits, gt_mask.unsqueeze(1))
-                dice = BinaryDiceLoss()(sample_probs[:, 1, :, :], gt_mask)
+                        intersection_area = (gt_roundtrip_area * gt_mask).sum()
+                        oracle_dice_loss_area = 1.0 - (
+                            2.0 * intersection_area + 1e-6
+                        ) / (
+                            gt_roundtrip_area.sum() + gt_mask.sum() + 1e-6
+                        )
+
+                        confidence = sample_probs.max(dim=1).values
+
+                        logger.info(
+                            f"[seg-loss-debug] "
+                            f"layer_map={tuple(layer_map[b:b+1].shape)} "
+                            f"sample_logits={tuple(sample_logits.shape)} "
+                            f"gt_mask={tuple(gt_mask.shape)} "
+                            f"gt_min={gt_mask.min().item():.4f} "
+                            f"gt_max={gt_mask.max().item():.4f} "
+                            f"gt_mean={gt_mask.mean().item():.8f} "
+                            f"gt_sum={gt_mask.sum().item():.2f}"
+                        )
+
+                        logger.info(
+                            f"[seg-pred-debug] "
+                            f"logits_min={sample_logits.min().item():.6f} "
+                            f"logits_max={sample_logits.max().item():.6f} "
+                            f"confidence_mean={confidence.mean().item():.6f} "
+                            f"defect_mean={pred_defect.mean().item():.8f} "
+                            f"defect_max={pred_defect.max().item():.6f} "
+                            f"normal_mean={pred_normal.mean().item():.8f} "
+                            f"normal_max={pred_normal.max().item():.6f}"
+                        )
+
+                        logger.info(
+                            f"[oracle-debug] "
+                            f"lowres_size={tuple(layer_map.shape[-2:])} "
+                            f"nearest_lowres_sum={gt_lowres_nearest.sum().item():.2f} "
+                            f"nearest_oracle_dice_loss={oracle_dice_loss_nearest.item():.6f} "
+                            f"area_lowres_min={gt_lowres_area.min().item():.6f} "
+                            f"area_lowres_max={gt_lowres_area.max().item():.6f} "
+                            f"area_lowres_sum={gt_lowres_area.sum().item():.2f} "
+                            f"area_oracle_dice_loss={oracle_dice_loss_area.item():.6f}"
+                        )
 
                 logger.info(
-                    f"[seg-res] layer_map={layer_map.shape[-2:]} gt_mask={gt_mask.shape[-2:]}"
+                    f"[seg-loss] layer={layer_idx} batch={b} "
+                    f"focal={focal.item():.6f} "
+                    f"dice_defect={dice_defect.item():.6f} "
+                    f"dice_normal={dice_normal.item():.6f} "
+                    f"layer_sample_loss={layer_sample_loss.item():.6f}"
                 )
 
-                logger.info(
-                    f"[loss] layer={layer_idx} batch={b}: "
-                    f"gt_mask pixels={gt_sum:.0f}/{mask_h * mask_w} "
-                    f"| pred_defect mean={pred_defect.mean().item():.4f} max={pred_defect.max().item():.4f} "
-                    f"| focal={focal.item():.6f} dice={dice.item():.6f}"
-                )
+        if num_terms == 0:
+            raise ValueError("No segmentation loss terms were computed")
 
-                seg_loss = seg_loss + focal + dice
+        seg_loss = seg_loss / num_terms
 
         return seg_loss
 

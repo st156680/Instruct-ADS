@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument(
         "--mask_size",
         type=int,
-        default=384,
+        default=1008,
         help="Target size for segmentation masks (H=W)",
     )
     parser.add_argument(
