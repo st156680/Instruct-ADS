@@ -18,6 +18,7 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
+
 class RiceConfig(PretrainedConfig):
     model_type = "rice_vit"
     base_config_key = "vision_config"
@@ -256,7 +257,10 @@ class Llavaonevision1_5Config(PretrainedConfig):
     """
 
     model_type = "llavaonevision1_5"
-    sub_configs = {"vision_config": RiceConfig, "text_config": LLaVAOneVision1_5_TextConfig}
+    sub_configs = {
+        "vision_config": RiceConfig,
+        "text_config": LLaVAOneVision1_5_TextConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -286,5 +290,6 @@ class Llavaonevision1_5Config(PretrainedConfig):
         self.return_anomaly_map = return_anomaly_map
 
         super().__init__(**kwargs)
+
 
 __all__ = ["Llavaonevision1_5Config", "LLaVAOneVision1_5_TextConfig"]

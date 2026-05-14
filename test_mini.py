@@ -51,17 +51,24 @@ def main():
     adapter_weights = safetensors.torch.load_file(
         "./checkpoints_mini/final/adapter_model.safetensors"
     )
-    seg_proj_weights = {
-        k.replace("base_model.model.model.seg_projector.", ""): v
-        for k, v in adapter_weights.items()
-        if "seg_projector" in k
-    }
+
+    seg_proj_weights = {}
+    for k, v in adapter_weights.items():
+        if "seg_projector" in k:
+            # Strip prefixes added by base_model and PEFT modules_to_save wrapper
+            new_k = k.split("seg_projector.")[-1]
+            new_k = new_k.replace("modules_to_save.default.", "")
+            seg_proj_weights[new_k] = v
+
     if (
         hasattr(model.model, "seg_projector")
         and getattr(model.model, "seg_projector", None) is not None
     ):
-        model.base_model.model.model.seg_projector.load_state_dict(seg_proj_weights)
-        print("Loaded fine-tuned seg_projector weights")
+        # Force strict=True to ensure the keys perfectly match and weights actually load
+        model.base_model.model.model.seg_projector.load_state_dict(
+            seg_proj_weights, strict=True
+        )
+        print("Loaded fine-tuned seg_projector weights successfully!")
 
     model.config.seg_token_idx = processor.tokenizer.convert_tokens_to_ids(
         "[SEG_DEFECT]"
@@ -139,6 +146,9 @@ def main():
             ).squeeze()
 
             heatmap = upsampled_map.cpu().float().numpy()
+            # Normalize: multi-layer sum can exceed 1.0
+            if heatmap.max() > 0:
+                heatmap = heatmap / heatmap.max()
 
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 1)

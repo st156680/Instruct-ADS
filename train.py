@@ -42,42 +42,85 @@ def rank0_log(msg: str, level: str = "info"):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Finetune LLaVA-OV 1.5 for anomaly detection")
-    parser.add_argument("--model_path", type=str, default="./model",
-                        help="Path to the pretrained model directory")
-    parser.add_argument("--data_path", type=str, required=True,
-                        help="Path to the training JSON file")
-    parser.add_argument("--image_root", type=str, default="",
-                        help="Root directory for image paths in the dataset")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints",
-                        help="Directory to save checkpoints")
-    parser.add_argument("--num_epochs", type=int, default=3,
-                        help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Per-device training batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8,
-                        help="Gradient accumulation steps")
-    parser.add_argument("--learning_rate", type=float, default=2e-5,
-                        help="Learning rate")
-    parser.add_argument("--mask_size", type=int, default=384,
-                        help="Target size for segmentation masks (H=W)")
-    parser.add_argument("--freeze_vision", action="store_true",
-                        help="Freeze the vision encoder during training")
-    parser.add_argument("--use_lora", action="store_true",
-                        help="Use LoRA for training to reduce memory usage")
-    parser.add_argument("--seg_training", action="store_true",
-                        help="Enable segmentation loss (requires masks in dataset)")
-    parser.add_argument("--seg_token", type=str, default="[SEG_DEFECT]",
-                        help="Segmentation defect token")
-    parser.add_argument("--seg_normal_token", type=str, default="[SEG_NORMAL]",
-                        help="Segmentation normal token")
+    parser = argparse.ArgumentParser(
+        description="Finetune LLaVA-OV 1.5 for anomaly detection"
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="./model",
+        help="Path to the pretrained model directory",
+    )
+    parser.add_argument(
+        "--data_path", type=str, required=True, help="Path to the training JSON file"
+    )
+    parser.add_argument(
+        "--image_root",
+        type=str,
+        default="",
+        help="Root directory for image paths in the dataset",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./checkpoints",
+        help="Directory to save checkpoints",
+    )
+    parser.add_argument(
+        "--num_epochs", type=int, default=3, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=1, help="Per-device training batch size"
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=8,
+        help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=2e-5, help="Learning rate"
+    )
+    parser.add_argument(
+        "--mask_size",
+        type=int,
+        default=384,
+        help="Target size for segmentation masks (H=W)",
+    )
+    parser.add_argument(
+        "--freeze_vision",
+        action="store_true",
+        help="Freeze the vision encoder during training",
+    )
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Use LoRA for training to reduce memory usage",
+    )
+    parser.add_argument(
+        "--seg_training",
+        action="store_true",
+        help="Enable segmentation loss (requires masks in dataset)",
+    )
+    parser.add_argument(
+        "--seg_token",
+        type=str,
+        default="[SEG_DEFECT]",
+        help="Segmentation defect token",
+    )
+    parser.add_argument(
+        "--seg_normal_token",
+        type=str,
+        default="[SEG_NORMAL]",
+        help="Segmentation normal token",
+    )
     return parser.parse_args()
 
 
 class AnomalyTrainer(Trainer):
     """
     Custom Trainer that handles the gt_segmentation_masks field.
-    
+
     The default Trainer would drop unknown columns. We override compute_loss
     to extract the masks and pass them to the model's forward method.
     """
@@ -96,7 +139,9 @@ class AnomalyTrainer(Trainer):
         loss = outputs.loss
 
         if loss is None:
-            raise ValueError("Model returned None loss. Check that labels are provided.")
+            raise ValueError(
+                "Model returned None loss. Check that labels are provided."
+            )
 
         return (loss, outputs) if return_outputs else loss
 
@@ -106,7 +151,10 @@ def main():
 
     # Clear stale HuggingFace module cache so our modified model code is used
     import shutil
-    hf_cache_modules = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules/model")
+
+    hf_cache_modules = os.path.expanduser(
+        "~/.cache/huggingface/modules/transformers_modules/model"
+    )
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if local_rank == 0 and os.path.exists(hf_cache_modules):
         shutil.rmtree(hf_cache_modules, ignore_errors=True)
@@ -125,10 +173,14 @@ def main():
         local_files_only=True,
     )
 
-    # Initialize custom segmentation projector with weights from the visual merger
+    # Initialize seg_projector with visual.merger weights — critical for gradient flow.
+    # With random init + temperature=100, cosine similarities are arbitrary → softmax
+    # saturates → near-zero gradients. Merger weights put features in the right space.
     if hasattr(model.model, "seg_projector"):
-        model.model.seg_projector.load_state_dict(model.model.visual.merger.state_dict())
-        rank0_log("Initialized custom seg_projector with visual.merger weights")
+        model.model.seg_projector.load_state_dict(
+            model.model.visual.merger.state_dict()
+        )
+        rank0_log("Initialized seg_projector with visual.merger weights")
 
     # --- Add SEG tokens ---
     rank0_log("Adding segmentation tokens to vocabulary...")
@@ -140,14 +192,16 @@ def main():
 
     # Resize model embeddings to accommodate new tokens
     model.resize_token_embeddings(len(processor.tokenizer))
-    
+
     # Store SEG token IDs in config for use during forward pass
     seg_token_id = processor.tokenizer.convert_tokens_to_ids(args.seg_token)
-    seg_normal_token_id = processor.tokenizer.convert_tokens_to_ids(args.seg_normal_token)
+    seg_normal_token_id = processor.tokenizer.convert_tokens_to_ids(
+        args.seg_normal_token
+    )
     model.config.seg_token_idx = seg_token_id
     model.config.seg_normal_token_idx = seg_normal_token_id
     rank0_log(f"SEG token IDs: defect={seg_token_id}, normal={seg_normal_token_id}")
-        
+
     # Update vocab_size in config so loss_function uses the correct size
     new_vocab_size = len(processor.tokenizer)
     model.config.vocab_size = new_vocab_size
@@ -155,7 +209,9 @@ def main():
 
     # Store SEG token IDs in config for use during forward pass
     seg_token_id = processor.tokenizer.convert_tokens_to_ids(args.seg_token)
-    seg_normal_token_id = processor.tokenizer.convert_tokens_to_ids(args.seg_normal_token)
+    seg_normal_token_id = processor.tokenizer.convert_tokens_to_ids(
+        args.seg_normal_token
+    )
     model.config.seg_token_idx = seg_token_id
     model.config.seg_normal_token_idx = seg_normal_token_id
     rank0_log(f"SEG token IDs: defect={seg_token_id}, normal={seg_normal_token_id}")
@@ -169,22 +225,22 @@ def main():
         # Count trainable parameters
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        rank0_log(f"Trainable: {trainable/1e9:.2f}B / Total: {total/1e9:.2f}B")
+        rank0_log(f"Trainable: {trainable / 1e9:.2f}B / Total: {total / 1e9:.2f}B")
 
     # --- Enable gradient checkpointing for memory savings ---
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
-    
+
     # --- Setup LoRA (optional) ---
     if args.use_lora:
         rank0_log("Applying LoRA...")
         from peft import LoraConfig, get_peft_model, TaskType
-        
+
         # Required for gradient checkpointing + LoRA
         model.enable_input_require_grads()
-        
+
         # Determine target modules. Qwen2 uses q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
-        modules_to_save = ["lm_head", "embed_tokens"] # Important for new vocab tokens
+        modules_to_save = ["lm_head", "embed_tokens"]  # Important for new vocab tokens
         if hasattr(model.model, "seg_projector"):
             modules_to_save.append("seg_projector")
             rank0_log("Added seg_projector to LoRA modules_to_save")
@@ -192,19 +248,51 @@ def main():
         lora_config = LoraConfig(
             r=64,
             lora_alpha=128,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
             lora_dropout=0.05,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
-            modules_to_save=modules_to_save
+            modules_to_save=modules_to_save,
         )
-        
+
         # When freezing vision, ensure vision modules are NOT targeted by LoRA if they match name patterns,
-        # but the above target modules are typical for the LLM. 
+        # but the above target modules are typical for the LLM.
         model = get_peft_model(model, lora_config)
-        
+
         # Print trainable parameters after LoRA
         model.print_trainable_parameters()
+
+        # --- Gradient hook to verify seg_projector is being trained ---
+        def _make_grad_hook(name):
+            def hook(grad):
+                if grad is not None:
+                    rank0_log(
+                        f"[grad] {name}: norm={grad.norm().item():.6f}"
+                    )
+            return hook
+
+        seg_proj = getattr(
+            getattr(model, "base_model", model),
+            "model", None
+        )
+        if seg_proj is not None:
+            seg_proj = getattr(seg_proj, "model", seg_proj)  # unwrap PeftModel -> base -> model
+            seg_proj = getattr(seg_proj, "seg_projector", None)
+        if seg_proj is not None:
+            for name, param in seg_proj.named_parameters():
+                if param.requires_grad:
+                    param.register_hook(_make_grad_hook(f"seg_projector.{name}"))
+            rank0_log("Registered gradient hooks on seg_projector")
+        else:
+            rank0_log("WARNING: Could not find seg_projector to register gradient hooks")
     else:
         rank0_log("Full fine-tuning (No LoRA)")
 
@@ -241,7 +329,7 @@ def main():
         dataloader_num_workers=4,
         remove_unused_columns=False,  # Important: keep gt_segmentation_masks
         gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={'use_reentrant': False},
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
         report_to="none",
         dataloader_pin_memory=True,
@@ -267,7 +355,11 @@ def main():
 
     # Copy modeling code so the saved checkpoint can be loaded with trust_remote_code
     import shutil
-    for py_file in ["modeling_llavaonevision1_5.py", "configuration_llavaonevision1_5.py"]:
+
+    for py_file in [
+        "modeling_llavaonevision1_5.py",
+        "configuration_llavaonevision1_5.py",
+    ]:
         src = os.path.join(args.model_path, py_file)
         dst = os.path.join(final_dir, py_file)
         if os.path.exists(src):
